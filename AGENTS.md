@@ -42,3 +42,39 @@
 * Ocean's 11 scoring engine
 # Expo HAS CHANGED
 
+## V1 Scope
+
+Ocean's 11 V1 ends at the Results Screen.
+
+Final V1 Flow:
+
+Home
+→ Courses
+→ Create/Edit Course
+→ New Round
+→ Player Entry
+→ Handicap Entry
+→ Score Round
+→ Results
+
+Out of Scope for V1:
+
+- Round History
+- Historical round browsing
+- Round archives
+- PDF export
+- Sharing results
+- Email results
+- Cloud sync
+- User accounts
+- Statistics and analytics
+- Tee management
+
+Primary Goal:
+
+Allow golfers to:
+1. Set up a game
+2. Score a game
+3. View results
+
+Do not implement features outside this scope unless explicitly approved.
