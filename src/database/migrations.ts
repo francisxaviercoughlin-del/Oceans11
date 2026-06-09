@@ -51,7 +51,8 @@ export async function migrateDatabase(
       'PRAGMA user_version;',
     );
 
-  let currentVersion = versionRow?.user_version ?? 0;
+  let currentVersion =
+    versionRow?.user_version ?? 0;
 
   if (currentVersion > DATABASE_VERSION) {
     throw new Error(
@@ -69,11 +70,11 @@ export async function migrateDatabase(
       );
     }
 
-    await database.withExclusiveTransactionAsync(
-      async (transaction) => {
-        await transaction.execAsync(migration);
+    await database.withTransactionAsync(
+      async () => {
+        await database.execAsync(migration);
 
-        await transaction.execAsync(
+        await database.execAsync(
           `PRAGMA user_version = ${nextVersion};`,
         );
       },

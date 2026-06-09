@@ -1,4 +1,7 @@
-import type { SQLiteDatabase } from 'expo-sqlite';
+import type {
+  SQLiteDatabase,
+  SQLiteStatement,
+} from 'expo-sqlite';
 import type {
   Course,
   CourseHole,
@@ -54,9 +57,9 @@ export class SqliteCourseRepository
 
     const now = new Date().toISOString();
 
-    await this.database.withExclusiveTransactionAsync(
-      async (transaction) => {
-        await transaction.runAsync(
+    await this.database.withTransactionAsync(
+      async () => {
+        await this.database.runAsync(
           `
             INSERT INTO courses (
               id,
@@ -79,25 +82,29 @@ export class SqliteCourseRepository
           },
         );
 
-        const statement =
-          await transaction.prepareAsync(
-            `
-              INSERT INTO course_holes (
-                course_id,
-                hole_number,
-                par,
-                stroke_index
-              )
-              VALUES (
-                $courseId,
-                $holeNumber,
-                $par,
-                $strokeIndex
-              );
-            `,
-          );
+        let statement:
+          | SQLiteStatement
+          | undefined;
 
         try {
+          statement =
+            await this.database.prepareAsync(
+              `
+                INSERT INTO course_holes (
+                  course_id,
+                  hole_number,
+                  par,
+                  stroke_index
+                )
+                VALUES (
+                  $courseId,
+                  $holeNumber,
+                  $par,
+                  $strokeIndex
+                );
+              `,
+            );
+
           for (
             const hole of validatedCourse.holes
           ) {
@@ -109,7 +116,7 @@ export class SqliteCourseRepository
             });
           }
         } finally {
-          await statement.finalizeAsync();
+          await statement?.finalizeAsync();
         }
       },
     );
