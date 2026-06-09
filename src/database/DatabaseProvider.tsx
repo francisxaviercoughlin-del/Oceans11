@@ -125,22 +125,18 @@ export default function DatabaseProvider({
   }
 
   return (
-    <View style={styles.container}>
+    <SQLiteProvider
+      key={providerKey}
+      databaseName={DATABASE_NAME}
+      onError={handleError}
+      onInit={initializeDatabase}
+    >
       {isInitializing ? (
         <DatabaseLoadingScreen />
-      ) : null}
-
-      <SQLiteProvider
-        key={providerKey}
-        databaseName={DATABASE_NAME}
-        onError={handleError}
-        onInit={initializeDatabase}
-      >
-        <View style={styles.appContainer}>
-          {children}
-        </View>
-      </SQLiteProvider>
-    </View>
+      ) : (
+        children
+      )}
+    </SQLiteProvider>
   );
 }
 
