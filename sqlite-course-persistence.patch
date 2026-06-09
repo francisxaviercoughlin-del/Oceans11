@@ -1,0 +1,1082 @@
+From b8f600afd5c7d8fcf6d22225e4e203173a937879 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 9 Jun 2026 05:15:29 +0000
+Subject: [PATCH] Add SQLite database, migrations, repository, and integrate
+ into UI
+
+### Motivation
+- Provide a persistent SQLite-backed storage for courses and replace in-memory models with a durable repository and schema.
+- Ensure database schema versioning and safe migrations when the app initializes.
+- Centralize data access behind a repository API to simplify screens and enable testable storage logic.
+
+### Description
+- Add `expo-sqlite` dependency and `DatabaseProvider` which wraps the app with `SQLiteProvider` and runs `migrateDatabase` on init, and wire it into `App.tsx` by wrapping `AppNavigator` with `DatabaseProvider` and `CourseRepositoryProvider`.
+- Implement database schema and migrations in `src/database/schema.ts` and `src/database/migrations.ts` which create `courses` and `course_holes` tables and set `PRAGMA` options and `user_version` handling.
+- Introduce repository interfaces and SQLite implementation: `CourseRepository`, `CourseRepositoryProvider`, and `SqliteCourseRepository` with methods `save`, `getAll`, `getById`, and `delete` and SQL-backed implementations including ID generation and transactions.
+- Refactor models and validation: expand `src/models/Course.ts` types, add `courseValidation.ts` to validate and normalize course drafts, and update `CreateCourseScreen` and `CoursesScreen` to use the repository, include loading/error states, input sanitization, and improved UI styling and accessibility.
+- Add a `typecheck` npm script in `package.json` and update `package-lock.json` to include `expo-sqlite` and related deps.
+
+### Testing
+- No automated tests were executed as part of this change.
+---
+ App.tsx                                       |  10 +-
+ package-lock.json                             |  19 +-
+ package.json                                  |   6 +-
+ src/database/DatabaseProvider.tsx             |  39 +++
+ src/database/migrations.ts                    |  59 +++++
+ src/database/schema.ts                        |   2 +
+ src/models/Course.ts                          |  35 ++-
+ src/models/courseValidation.ts                |  66 +++++
+ src/repositories/CourseRepository.ts          |   8 +
+ src/repositories/CourseRepositoryProvider.tsx |  27 ++
+ src/repositories/SqliteCourseRepository.ts    | 147 +++++++++++
+ src/screens/CoursesScreen.tsx                 | 231 +++++++++++++++-
+ src/screens/CreateCourseScreen.tsx            | 247 ++++++++++++++----
+ 13 files changed, 828 insertions(+), 68 deletions(-)
+ create mode 100644 src/database/DatabaseProvider.tsx
+ create mode 100644 src/database/migrations.ts
+ create mode 100644 src/database/schema.ts
+ create mode 100644 src/models/courseValidation.ts
+ create mode 100644 src/repositories/CourseRepository.ts
+ create mode 100644 src/repositories/CourseRepositoryProvider.tsx
+ create mode 100644 src/repositories/SqliteCourseRepository.ts
+
+diff --git a/App.tsx b/App.tsx
+index 318365e..c24424a 100644
+--- a/App.tsx
++++ b/App.tsx
+@@ -1,6 +1,14 @@
+ import React from 'react';
++import DatabaseProvider from './src/database/DatabaseProvider';
+ import AppNavigator from './src/navigation/AppNavigator';
++import { CourseRepositoryProvider } from './src/repositories/CourseRepositoryProvider';
+ 
+ export default function App() {
+-  return <AppNavigator />;
++  return (
++    <DatabaseProvider>
++      <CourseRepositoryProvider>
++        <AppNavigator />
++      </CourseRepositoryProvider>
++    </DatabaseProvider>
++  );
+ }
+diff --git a/package-lock.json b/package-lock.json
+index 12f908b..48979a2 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -18,7 +18,8 @@
+         "react-native-safe-area-context": "~5.7.0",
+         "react-native-screens": "4.25.2",
+         "react-native-w": "^1.0.0",
+-        "react-native-web": "^0.21.2"
++        "react-native-web": "^0.21.2",
++        "expo-sqlite": "~56.0.4"
+       },
+       "devDependencies": {
+         "@types/react": "~19.2.2",
+@@ -6570,6 +6571,22 @@
+       "funding": {
+         "url": "https://github.com/sponsors/colinhacks"
+       }
++    },
++    "node_modules/await-lock": {
++      "version": "2.2.2",
++      "resolved": "https://registry.npmjs.org/await-lock/-/await-lock-2.2.2.tgz"
++    },
++    "node_modules/expo-sqlite": {
++      "version": "56.0.4",
++      "resolved": "https://registry.npmjs.org/expo-sqlite/-/expo-sqlite-56.0.4.tgz",
++      "dependencies": {
++        "await-lock": "^2.2.2"
++      },
++      "peerDependencies": {
++        "expo": "*",
++        "react": "*",
++        "react-native": "*"
++      }
+     }
+   }
+ }
+diff --git a/package.json b/package.json
+index 7a64fd1..e38b431 100644
+--- a/package.json
++++ b/package.json
+@@ -13,7 +13,8 @@
+     "react-native-safe-area-context": "~5.7.0",
+     "react-native-screens": "4.25.2",
+     "react-native-w": "^1.0.0",
+-    "react-native-web": "^0.21.2"
++    "react-native-web": "^0.21.2",
++    "expo-sqlite": "~56.0.4"
+   },
+   "devDependencies": {
+     "@types/react": "~19.2.2",
+@@ -23,7 +24,8 @@
+     "start": "expo start",
+     "android": "expo start --android",
+     "ios": "expo start --ios",
+-    "web": "expo start --web"
++    "web": "expo start --web",
++    "typecheck": "tsc --noEmit"
+   },
+   "private": true
+ }
+diff --git a/src/database/DatabaseProvider.tsx b/src/database/DatabaseProvider.tsx
+new file mode 100644
+index 0000000..d7b8bc7
+--- /dev/null
++++ b/src/database/DatabaseProvider.tsx
+@@ -0,0 +1,39 @@
++import React, { Suspense, type PropsWithChildren } from 'react';
++import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
++import { SQLiteProvider } from 'expo-sqlite';
++import { migrateDatabase } from './migrations';
++import { DATABASE_NAME } from './schema';
++
++function DatabaseLoadingScreen() {
++  return (
++    <View style={styles.container}>
++      <ActivityIndicator color="#8B3A3A" size="large" />
++      <Text style={styles.message}>Preparing your courses…</Text>
++    </View>
++  );
++}
++
++export default function DatabaseProvider({ children }: PropsWithChildren) {
++  return (
++    <Suspense fallback={<DatabaseLoadingScreen />}>
++      <SQLiteProvider databaseName={DATABASE_NAME} onInit={migrateDatabase} useSuspense>
++        {children}
++      </SQLiteProvider>
++    </Suspense>
++  );
++}
++
++const styles = StyleSheet.create({
++  container: {
++    flex: 1,
++    alignItems: 'center',
++    justifyContent: 'center',
++    gap: 12,
++    backgroundColor: '#F8F5EF',
++    padding: 24,
++  },
++  message: {
++    color: '#2F2F2F',
++    fontSize: 16,
++  },
++});
+diff --git a/src/database/migrations.ts b/src/database/migrations.ts
+new file mode 100644
+index 0000000..5ad57df
+--- /dev/null
++++ b/src/database/migrations.ts
+@@ -0,0 +1,59 @@
++import type { SQLiteDatabase } from 'expo-sqlite';
++import { DATABASE_VERSION } from './schema';
++
++type UserVersionRow = {
++  user_version: number;
++};
++
++const migrations: Record<number, string> = {
++  1: `
++    CREATE TABLE IF NOT EXISTS courses (
++      id TEXT PRIMARY KEY NOT NULL,
++      name TEXT NOT NULL CHECK (length(trim(name)) > 0),
++      created_at TEXT NOT NULL,
++      updated_at TEXT NOT NULL
++    );
++
++    CREATE TABLE IF NOT EXISTS course_holes (
++      course_id TEXT NOT NULL,
++      hole_number INTEGER NOT NULL CHECK (hole_number BETWEEN 1 AND 18),
++      par INTEGER NOT NULL CHECK (par BETWEEN 3 AND 5),
++      stroke_index INTEGER NOT NULL CHECK (stroke_index BETWEEN 1 AND 18),
++      PRIMARY KEY (course_id, hole_number),
++      UNIQUE (course_id, stroke_index),
++      FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE
++    );
++
++    CREATE INDEX IF NOT EXISTS idx_courses_name ON courses(name COLLATE NOCASE);
++  `,
++};
++
++export async function migrateDatabase(db: SQLiteDatabase): Promise<void> {
++  await db.execAsync('PRAGMA foreign_keys = ON;');
++  await db.execAsync('PRAGMA journal_mode = WAL;');
++
++  const versionRow = await db.getFirstAsync<UserVersionRow>('PRAGMA user_version;');
++  let currentVersion = versionRow?.user_version ?? 0;
++
++  if (currentVersion > DATABASE_VERSION) {
++    throw new Error(
++      `Database version ${currentVersion} is newer than supported version ${DATABASE_VERSION}.`,
++    );
++  }
++
++  while (currentVersion < DATABASE_VERSION) {
++    const nextVersion = currentVersion + 1;
++    const migration = migrations[nextVersion];
++
++    if (!migration) {
++      throw new Error(`Missing database migration for version ${nextVersion}.`);
++    }
++
++    await db.withExclusiveTransactionAsync(async (transaction) => {
++      await transaction.execAsync(migration);
++      await transaction.execAsync(`PRAGMA user_version = ${nextVersion};`);
++    });
++
++    currentVersion = nextVersion;
++  }
++}
+diff --git a/src/database/schema.ts b/src/database/schema.ts
+new file mode 100644
+index 0000000..04cf9d9
+--- /dev/null
++++ b/src/database/schema.ts
+@@ -0,0 +1,2 @@
++export const DATABASE_NAME = 'oceans11.db';
++export const DATABASE_VERSION = 1;
+diff --git a/src/models/Course.ts b/src/models/Course.ts
+index fb0b608..c363614 100644
+--- a/src/models/Course.ts
++++ b/src/models/Course.ts
+@@ -1,11 +1,34 @@
++export type Par = 3 | 4 | 5;
+ 
+-export interface Hole {
+-  hole:number;
+-  par:number;
+-  strokeIndex:string;
++export interface CourseHole {
++  holeNumber: number;
++  par: Par;
++  strokeIndex: number;
+ }
+ 
+ export interface Course {
+-  name:string;
+-  holes:Hole[];
++  id: string;
++  name: string;
++  holes: CourseHole[];
++  createdAt: string;
++  updatedAt: string;
++}
++
++export interface NewCourse {
++  name: string;
++  holes: CourseHole[];
++}
++
++export interface CourseSummary {
++  id: string;
++  name: string;
++  totalPar: number;
++  createdAt: string;
++  updatedAt: string;
++}
++
++export interface CourseHoleDraft {
++  holeNumber: number;
++  par: Par;
++  strokeIndex: string;
+ }
+diff --git a/src/models/courseValidation.ts b/src/models/courseValidation.ts
+new file mode 100644
+index 0000000..3520a98
+--- /dev/null
++++ b/src/models/courseValidation.ts
+@@ -0,0 +1,66 @@
++import type { CourseHole, CourseHoleDraft, NewCourse, Par } from './Course';
++
++export class CourseValidationError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = 'CourseValidationError';
++  }
++}
++
++function isPar(value: number): value is Par {
++  return value === 3 || value === 4 || value === 5;
++}
++
++function validateHoles(holes: readonly CourseHole[]): void {
++  if (holes.length !== 18) {
++    throw new CourseValidationError('A course must contain exactly 18 holes.');
++  }
++
++  const holeNumbers = holes.map((hole) => hole.holeNumber);
++  const strokeIndexes = holes.map((hole) => hole.strokeIndex);
++
++  if (
++    holeNumbers.some((holeNumber) => !Number.isInteger(holeNumber) || holeNumber < 1 || holeNumber > 18) ||
++    new Set(holeNumbers).size !== 18
++  ) {
++    throw new CourseValidationError('Hole numbers must be unique values from 1 through 18.');
++  }
++
++  if (holes.some((hole) => !isPar(hole.par))) {
++    throw new CourseValidationError('Par must be 3, 4, or 5 for every hole.');
++  }
++
++  if (
++    strokeIndexes.some(
++      (strokeIndex) => !Number.isInteger(strokeIndex) || strokeIndex < 1 || strokeIndex > 18,
++    ) ||
++    new Set(strokeIndexes).size !== 18
++  ) {
++    throw new CourseValidationError('Stroke indexes must be unique values from 1 through 18.');
++  }
++}
++
++export function validateNewCourse(course: NewCourse): NewCourse {
++  const name = course.name.trim();
++
++  if (!name) {
++    throw new CourseValidationError('Enter a course name.');
++  }
++
++  validateHoles(course.holes);
++
++  return {
++    name,
++    holes: [...course.holes].sort((left, right) => left.holeNumber - right.holeNumber),
++  };
++}
++
++export function courseFromDraft(name: string, holes: readonly CourseHoleDraft[]): NewCourse {
++  const parsedHoles = holes.map<CourseHole>((hole) => ({
++    holeNumber: hole.holeNumber,
++    par: hole.par,
++    strokeIndex: Number(hole.strokeIndex),
++  }));
++
++  return validateNewCourse({ name, holes: parsedHoles });
++}
+diff --git a/src/repositories/CourseRepository.ts b/src/repositories/CourseRepository.ts
+new file mode 100644
+index 0000000..633b006
+--- /dev/null
++++ b/src/repositories/CourseRepository.ts
+@@ -0,0 +1,8 @@
++import type { Course, CourseSummary, NewCourse } from '../models/Course';
++
++export interface CourseRepository {
++  save(course: NewCourse): Promise<Course>;
++  getAll(): Promise<CourseSummary[]>;
++  getById(id: string): Promise<Course | null>;
++  delete(id: string): Promise<void>;
++}
+diff --git a/src/repositories/CourseRepositoryProvider.tsx b/src/repositories/CourseRepositoryProvider.tsx
+new file mode 100644
+index 0000000..aa3c0fe
+--- /dev/null
++++ b/src/repositories/CourseRepositoryProvider.tsx
+@@ -0,0 +1,27 @@
++import React, { createContext, useContext, useMemo, type PropsWithChildren } from 'react';
++import { useSQLiteContext } from 'expo-sqlite';
++import type { CourseRepository } from './CourseRepository';
++import { SqliteCourseRepository } from './SqliteCourseRepository';
++
++const CourseRepositoryContext = createContext<CourseRepository | null>(null);
++
++export function CourseRepositoryProvider({ children }: PropsWithChildren) {
++  const database = useSQLiteContext();
++  const repository = useMemo(() => new SqliteCourseRepository(database), [database]);
++
++  return (
++    <CourseRepositoryContext.Provider value={repository}>
++      {children}
++    </CourseRepositoryContext.Provider>
++  );
++}
++
++export function useCourseRepository(): CourseRepository {
++  const repository = useContext(CourseRepositoryContext);
++
++  if (!repository) {
++    throw new Error('useCourseRepository must be used within CourseRepositoryProvider.');
++  }
++
++  return repository;
++}
+diff --git a/src/repositories/SqliteCourseRepository.ts b/src/repositories/SqliteCourseRepository.ts
+new file mode 100644
+index 0000000..1f2078a
+--- /dev/null
++++ b/src/repositories/SqliteCourseRepository.ts
+@@ -0,0 +1,147 @@
++import type { SQLiteDatabase } from 'expo-sqlite';
++import type {
++  Course,
++  CourseHole,
++  CourseSummary,
++  NewCourse,
++  Par,
++} from '../models/Course';
++import { validateNewCourse } from '../models/courseValidation';
++import type { CourseRepository } from './CourseRepository';
++
++type CourseRow = {
++  id: string;
++  name: string;
++  created_at: string;
++  updated_at: string;
++};
++
++type CourseSummaryRow = CourseRow & {
++  total_par: number;
++};
++
++type CourseHoleRow = {
++  hole_number: number;
++  par: number;
++  stroke_index: number;
++};
++
++type GeneratedIdRow = {
++  id: string;
++};
++
++export class SqliteCourseRepository implements CourseRepository {
++  constructor(private readonly db: SQLiteDatabase) {}
++
++  async save(course: NewCourse): Promise<Course> {
++    const validatedCourse = validateNewCourse(course);
++    const idRow = await this.db.getFirstAsync<GeneratedIdRow>(
++      'SELECT lower(hex(randomblob(16))) AS id;',
++    );
++
++    if (!idRow) {
++      throw new Error('Unable to generate a course identifier.');
++    }
++
++    const now = new Date().toISOString();
++
++    await this.db.withExclusiveTransactionAsync(async (transaction) => {
++      await transaction.runAsync(
++        `INSERT INTO courses (id, name, created_at, updated_at)
++         VALUES ($id, $name, $createdAt, $updatedAt);`,
++        {
++          $id: idRow.id,
++          $name: validatedCourse.name,
++          $createdAt: now,
++          $updatedAt: now,
++        },
++      );
++
++      const statement = await transaction.prepareAsync(
++        `INSERT INTO course_holes (course_id, hole_number, par, stroke_index)
++         VALUES ($courseId, $holeNumber, $par, $strokeIndex);`,
++      );
++
++      try {
++        for (const hole of validatedCourse.holes) {
++          await statement.executeAsync({
++            $courseId: idRow.id,
++            $holeNumber: hole.holeNumber,
++            $par: hole.par,
++            $strokeIndex: hole.strokeIndex,
++          });
++        }
++      } finally {
++        await statement.finalizeAsync();
++      }
++    });
++
++    return {
++      id: idRow.id,
++      name: validatedCourse.name,
++      holes: validatedCourse.holes,
++      createdAt: now,
++      updatedAt: now,
++    };
++  }
++
++  async getAll(): Promise<CourseSummary[]> {
++    const rows = await this.db.getAllAsync<CourseSummaryRow>(
++      `SELECT
++         courses.id,
++         courses.name,
++         courses.created_at,
++         courses.updated_at,
++         COALESCE(SUM(course_holes.par), 0) AS total_par
++       FROM courses
++       LEFT JOIN course_holes ON course_holes.course_id = courses.id
++       GROUP BY courses.id
++       ORDER BY courses.name COLLATE NOCASE ASC, courses.created_at ASC;`,
++    );
++
++    return rows.map((row) => ({
++      id: row.id,
++      name: row.name,
++      totalPar: row.total_par,
++      createdAt: row.created_at,
++      updatedAt: row.updated_at,
++    }));
++  }
++
++  async getById(id: string): Promise<Course | null> {
++    const courseRow = await this.db.getFirstAsync<CourseRow>(
++      `SELECT id, name, created_at, updated_at
++       FROM courses
++       WHERE id = $id;`,
++      { $id: id },
++    );
++
++    if (!courseRow) {
++      return null;
++    }
++
++    const holeRows = await this.db.getAllAsync<CourseHoleRow>(
++      `SELECT hole_number, par, stroke_index
++       FROM course_holes
++       WHERE course_id = $courseId
++       ORDER BY hole_number ASC;`,
++      { $courseId: id },
++    );
++
++    return {
++      id: courseRow.id,
++      name: courseRow.name,
++      holes: holeRows.map<CourseHole>((row) => ({
++        holeNumber: row.hole_number,
++        par: row.par as Par,
++        strokeIndex: row.stroke_index,
++      })),
++      createdAt: courseRow.created_at,
++      updatedAt: courseRow.updated_at,
++    };
++  }
++
++  async delete(id: string): Promise<void> {
++    await this.db.runAsync('DELETE FROM courses WHERE id = $id;', { $id: id });
++  }
++}
+diff --git a/src/screens/CoursesScreen.tsx b/src/screens/CoursesScreen.tsx
+index b722629..6559a08 100644
+--- a/src/screens/CoursesScreen.tsx
++++ b/src/screens/CoursesScreen.tsx
+@@ -1,17 +1,232 @@
++import React, { useCallback, useState } from 'react';
++import {
++  ActivityIndicator,
++  Alert,
++  FlatList,
++  SafeAreaView,
++  StyleSheet,
++  Text,
++  TouchableOpacity,
++  View,
++} from 'react-native';
++import { useFocusEffect } from '@react-navigation/native';
++import type { CourseSummary } from '../models/Course';
++import { useCourseRepository } from '../repositories/CourseRepositoryProvider';
+ 
+-import React from 'react';
+-import { SafeAreaView, Text, TouchableOpacity } from 'react-native';
++type CoursesNavigation = {
++  navigate(route: 'CreateCourse'): void;
++};
++
++export default function CoursesScreen({ navigation }: { navigation: CoursesNavigation }) {
++  const courseRepository = useCourseRepository();
++  const [courses, setCourses] = useState<CourseSummary[]>([]);
++  const [isLoading, setIsLoading] = useState(true);
++  const [errorMessage, setErrorMessage] = useState<string | null>(null);
++
++  const loadCourses = useCallback(async () => {
++    setErrorMessage(null);
++
++    try {
++      setIsLoading(true);
++      setCourses(await courseRepository.getAll());
++    } catch {
++      setErrorMessage('Courses could not be loaded. Please try again.');
++    } finally {
++      setIsLoading(false);
++    }
++  }, [courseRepository]);
++
++  useFocusEffect(
++    useCallback(() => {
++      void loadCourses();
++    }, [loadCourses]),
++  );
++
++  const deleteCourse = async (course: CourseSummary) => {
++    try {
++      await courseRepository.delete(course.id);
++      await loadCourses();
++    } catch {
++      Alert.alert('Unable to delete course', 'Please try again.');
++    }
++  };
++
++  const confirmDelete = (course: CourseSummary) => {
++    Alert.alert(
++      'Delete course?',
++      `${course.name} will be permanently removed.`,
++      [
++        { text: 'Cancel', style: 'cancel' },
++        {
++          text: 'Delete',
++          style: 'destructive',
++          onPress: () => void deleteCourse(course),
++        },
++      ],
++    );
++  };
++
++  const renderCourse = ({ item }: { item: CourseSummary }) => (
++    <View style={styles.courseRow}>
++      <View style={styles.courseDetails}>
++        <Text style={styles.courseName}>{item.name}</Text>
++        <Text style={styles.courseMeta}>18 holes · Par {item.totalPar}</Text>
++      </View>
++      <TouchableOpacity
++        accessibilityLabel={`Delete ${item.name}`}
++        accessibilityRole="button"
++        onPress={() => confirmDelete(item)}
++        style={styles.deleteButton}
++      >
++        <Text style={styles.deleteButtonText}>DELETE</Text>
++      </TouchableOpacity>
++    </View>
++  );
+ 
+-export default function CoursesScreen({navigation}:any){
+   return (
+-    <SafeAreaView style={{padding:20}}>
+-      <Text style={{fontSize:28,fontWeight:'700'}}>Courses</Text>
++    <SafeAreaView style={styles.container}>
++      <Text style={styles.title}>Courses</Text>
++
++      {isLoading ? (
++        <View style={styles.stateContainer}>
++          <ActivityIndicator color="#8B3A3A" size="large" />
++          <Text style={styles.stateText}>Loading courses…</Text>
++        </View>
++      ) : errorMessage ? (
++        <View style={styles.stateContainer}>
++          <Text accessibilityRole="alert" style={styles.errorText}>
++            {errorMessage}
++          </Text>
++          <TouchableOpacity
++            accessibilityRole="button"
++            onPress={() => void loadCourses()}
++            style={styles.retryButton}
++          >
++            <Text style={styles.retryButtonText}>TRY AGAIN</Text>
++          </TouchableOpacity>
++        </View>
++      ) : (
++        <FlatList
++          contentContainerStyle={courses.length === 0 ? styles.emptyList : styles.list}
++          data={courses}
++          keyExtractor={(course) => course.id}
++          renderItem={renderCourse}
++          ListEmptyComponent={
++            <View style={styles.stateContainer}>
++              <Text style={styles.emptyTitle}>No courses yet</Text>
++              <Text style={styles.stateText}>Create a course to start setting up rounds.</Text>
++            </View>
++          }
++        />
++      )}
++
+       <TouchableOpacity
+-        onPress={()=>navigation.navigate('CreateCourse')}
+-        style={{marginTop:20,padding:16,backgroundColor:'#8B3A3A'}}
++        accessibilityRole="button"
++        onPress={() => navigation.navigate('CreateCourse')}
++        style={styles.createButton}
+       >
+-        <Text style={{color:'white'}}>CREATE COURSE</Text>
++        <Text style={styles.createButtonText}>CREATE COURSE</Text>
+       </TouchableOpacity>
+     </SafeAreaView>
+   );
+ }
++
++const styles = StyleSheet.create({
++  container: {
++    flex: 1,
++    padding: 20,
++    backgroundColor: '#F8F5EF',
++  },
++  title: {
++    color: '#2F2F2F',
++    fontSize: 28,
++    fontWeight: '700',
++    marginBottom: 16,
++  },
++  list: {
++    paddingBottom: 16,
++  },
++  emptyList: {
++    flexGrow: 1,
++  },
++  courseRow: {
++    minHeight: 72,
++    flexDirection: 'row',
++    alignItems: 'center',
++    borderBottomWidth: StyleSheet.hairlineWidth,
++    borderBottomColor: '#CFC6BB',
++    paddingVertical: 12,
++  },
++  courseDetails: {
++    flex: 1,
++    paddingRight: 12,
++  },
++  courseName: {
++    color: '#2F2F2F',
++    fontSize: 17,
++    fontWeight: '600',
++  },
++  courseMeta: {
++    color: '#6F6861',
++    fontSize: 14,
++    marginTop: 4,
++  },
++  deleteButton: {
++    minHeight: 44,
++    justifyContent: 'center',
++    paddingHorizontal: 8,
++  },
++  deleteButtonText: {
++    color: '#8B3A3A',
++    fontSize: 12,
++    fontWeight: '700',
++  },
++  stateContainer: {
++    flex: 1,
++    alignItems: 'center',
++    justifyContent: 'center',
++    gap: 12,
++    padding: 24,
++  },
++  stateText: {
++    color: '#6F6861',
++    fontSize: 15,
++    textAlign: 'center',
++  },
++  emptyTitle: {
++    color: '#2F2F2F',
++    fontSize: 20,
++    fontWeight: '600',
++  },
++  errorText: {
++    color: '#A12622',
++    fontSize: 15,
++    textAlign: 'center',
++  },
++  retryButton: {
++    minHeight: 44,
++    justifyContent: 'center',
++    borderWidth: 1,
++    borderColor: '#8B3A3A',
++    borderRadius: 8,
++    paddingHorizontal: 16,
++  },
++  retryButtonText: {
++    color: '#8B3A3A',
++    fontWeight: '700',
++  },
++  createButton: {
++    minHeight: 52,
++    alignItems: 'center',
++    justifyContent: 'center',
++    borderRadius: 8,
++    backgroundColor: '#8B3A3A',
++    paddingHorizontal: 16,
++    marginTop: 12,
++  },
++  createButtonText: {
++    color: '#FFFFFF',
++    fontWeight: '700',
++    letterSpacing: 0.5,
++  },
++});
+diff --git a/src/screens/CreateCourseScreen.tsx b/src/screens/CreateCourseScreen.tsx
+index c9461c8..ca8da24 100644
+--- a/src/screens/CreateCourseScreen.tsx
++++ b/src/screens/CreateCourseScreen.tsx
+@@ -1,74 +1,221 @@
+-
+ import React, { useMemo, useState } from 'react';
+-import { ScrollView, View, Text, TextInput, TouchableOpacity } from 'react-native';
++import {
++  ActivityIndicator,
++  ScrollView,
++  StyleSheet,
++  Text,
++  TextInput,
++  TouchableOpacity,
++  View,
++} from 'react-native';
+ import ParStepper from '../components/ParStepper';
++import type { CourseHoleDraft, Par } from '../models/Course';
++import { courseFromDraft, CourseValidationError } from '../models/courseValidation';
++import { useCourseRepository } from '../repositories/CourseRepositoryProvider';
+ 
+-export default function CreateCourseScreen() {
+-  const [name,setName] = useState('');
+-  const [holes,setHoles] = useState(
+-    Array.from({length:18},(_,i)=>({
+-      hole:i+1,
+-      par:4,
+-      strokeIndex:''
+-    }))
+-  );
++const initialHoles: CourseHoleDraft[] = Array.from({ length: 18 }, (_, index) => ({
++  holeNumber: index + 1,
++  par: 4,
++  strokeIndex: '',
++}));
++
++function getErrorMessage(error: unknown): string {
++  if (error instanceof CourseValidationError) {
++    return error.message;
++  }
++
++  return 'The course could not be saved. Please try again.';
++}
++
++export default function CreateCourseScreen({ navigation }: { navigation: { goBack(): void } }) {
++  const courseRepository = useCourseRepository();
++  const [name, setName] = useState('');
++  const [holes, setHoles] = useState<CourseHoleDraft[]>(initialHoles);
++  const [isSaving, setIsSaving] = useState(false);
++  const [errorMessage, setErrorMessage] = useState<string | null>(null);
++
++  const isValid = useMemo(() => {
++    try {
++      courseFromDraft(name, holes);
++      return true;
++    } catch {
++      return false;
++    }
++  }, [holes, name]);
+ 
+-  const updatePar=(idx:number,val:number)=>{
+-    const h=[...holes]; h[idx].par=val; setHoles(h);
++  const updatePar = (index: number, par: number) => {
++    setHoles((currentHoles) =>
++      currentHoles.map((hole, holeIndex) =>
++        holeIndex === index ? { ...hole, par: par as Par } : hole,
++      ),
++    );
+   };
+ 
+-  const updateSI=(idx:number,val:string)=>{
+-    const h=[...holes]; h[idx].strokeIndex=val; setHoles(h);
++  const updateStrokeIndex = (index: number, strokeIndex: string) => {
++    const numericInput = strokeIndex.replace(/[^0-9]/g, '').slice(0, 2);
++    setHoles((currentHoles) =>
++      currentHoles.map((hole, holeIndex) =>
++        holeIndex === index ? { ...hole, strokeIndex: numericInput } : hole,
++      ),
++    );
+   };
+ 
+-  const valid = useMemo(()=>{
+-    const sis=holes.map(h=>h.strokeIndex);
+-    if(!name.trim()) return false;
+-    if(sis.some(s=>!s)) return false;
+-    const nums=sis.map(Number);
+-    if(nums.some(n=>n<1 || n>18)) return false;
+-    return new Set(nums).size===18;
+-  },[name,holes]);
+-
+-  const renderRange=(start:number,end:number)=> (
+-    holes.slice(start,end).map((h,idx)=>(
+-      <View key={h.hole} style={{flexDirection:'row',justifyContent:'space-between',marginBottom:10}}>
+-        <Text>Hole {h.hole}</Text>
+-        <ParStepper value={h.par} onChange={(v:number)=>updatePar(start+idx,v)} />
+-        <TextInput
+-          value={h.strokeIndex}
+-          onChangeText={(t)=>updateSI(start+idx,t)}
+-          keyboardType="numeric"
+-          placeholder="SI"
+-          style={{borderWidth:1,width:50,padding:4}}
+-        />
+-      </View>
+-    ))
+-  );
++  const saveCourse = async () => {
++    setErrorMessage(null);
++
++    try {
++      const course = courseFromDraft(name, holes);
++      setIsSaving(true);
++      await courseRepository.save(course);
++      navigation.goBack();
++    } catch (error) {
++      setErrorMessage(getErrorMessage(error));
++    } finally {
++      setIsSaving(false);
++    }
++  };
++
++  const renderRange = (start: number, end: number) =>
++    holes.slice(start, end).map((hole, rangeIndex) => {
++      const holeIndex = start + rangeIndex;
++
++      return (
++        <View key={hole.holeNumber} style={styles.holeRow}>
++          <Text style={styles.holeLabel}>Hole {hole.holeNumber}</Text>
++          <ParStepper value={hole.par} onChange={(par: number) => updatePar(holeIndex, par)} />
++          <TextInput
++            accessibilityLabel={`Stroke index for hole ${hole.holeNumber}`}
++            value={hole.strokeIndex}
++            onChangeText={(value) => updateStrokeIndex(holeIndex, value)}
++            keyboardType="number-pad"
++            maxLength={2}
++            placeholder="SI"
++            returnKeyType="done"
++            style={styles.strokeIndexInput}
++          />
++        </View>
++      );
++    });
+ 
+   return (
+-    <ScrollView contentContainerStyle={{padding:20}}>
+-      <Text style={{fontSize:28,fontWeight:'700'}}>Create Course</Text>
++    <ScrollView
++      contentContainerStyle={styles.content}
++      keyboardShouldPersistTaps="handled"
++    >
++      <Text style={styles.title}>Create Course</Text>
+       <TextInput
++        accessibilityLabel="Course name"
++        autoCapitalize="words"
+         placeholder="Course Name"
+         value={name}
+         onChangeText={setName}
+-        style={{borderWidth:1,padding:10,marginVertical:20}}
++        style={styles.nameInput}
+       />
+ 
+-      <Text style={{fontSize:22,fontWeight:'700'}}>Front 9</Text>
+-      {renderRange(0,9)}
++      <Text style={styles.sectionTitle}>Front 9</Text>
++      {renderRange(0, 9)}
++
++      <Text style={[styles.sectionTitle, styles.backNineTitle]}>Back 9</Text>
++      {renderRange(9, 18)}
+ 
+-      <Text style={{fontSize:22,fontWeight:'700',marginTop:20}}>Back 9</Text>
+-      {renderRange(9,18)}
++      {errorMessage ? (
++        <Text accessibilityRole="alert" style={styles.errorText}>
++          {errorMessage}
++        </Text>
++      ) : null}
+ 
+       <TouchableOpacity
+-        disabled={!valid}
+-        onPress={()=>console.log({name,holes})}
+-        style={{backgroundColor: valid ? '#8B3A3A':'#999',padding:16,marginTop:20}}
++        accessibilityRole="button"
++        disabled={!isValid || isSaving}
++        onPress={() => void saveCourse()}
++        style={[styles.saveButton, (!isValid || isSaving) && styles.saveButtonDisabled]}
+       >
+-        <Text style={{color:'white',textAlign:'center'}}>SAVE COURSE</Text>
++        {isSaving ? (
++          <ActivityIndicator color="#FFFFFF" />
++        ) : (
++          <Text style={styles.saveButtonText}>SAVE COURSE</Text>
++        )}
+       </TouchableOpacity>
+     </ScrollView>
+   );
+ }
++
++const styles = StyleSheet.create({
++  content: {
++    padding: 20,
++    paddingBottom: 40,
++    backgroundColor: '#F8F5EF',
++  },
++  title: {
++    color: '#2F2F2F',
++    fontSize: 28,
++    fontWeight: '700',
++  },
++  nameInput: {
++    minHeight: 48,
++    borderWidth: 1,
++    borderColor: '#B9AFA3',
++    borderRadius: 8,
++    paddingHorizontal: 12,
++    marginVertical: 20,
++    backgroundColor: '#FFFFFF',
++    color: '#2F2F2F',
++    fontSize: 16,
++  },
++  sectionTitle: {
++    color: '#8B3A3A',
++    fontSize: 22,
++    fontWeight: '700',
++    marginBottom: 12,
++  },
++  backNineTitle: {
++    marginTop: 20,
++  },
++  holeRow: {
++    minHeight: 52,
++    flexDirection: 'row',
++    alignItems: 'center',
++    justifyContent: 'space-between',
++    gap: 12,
++    marginBottom: 10,
++  },
++  holeLabel: {
++    width: 60,
++    color: '#2F2F2F',
++    fontSize: 16,
++  },
++  strokeIndexInput: {
++    width: 52,
++    minHeight: 44,
++    borderWidth: 1,
++    borderColor: '#B9AFA3',
++    borderRadius: 6,
++    backgroundColor: '#FFFFFF',
++    color: '#2F2F2F',
++    paddingHorizontal: 8,
++    textAlign: 'center',
++    fontSize: 16,
++  },
++  errorText: {
++    color: '#A12622',
++    fontSize: 14,
++    marginTop: 12,
++  },
++  saveButton: {
++    minHeight: 52,
++    alignItems: 'center',
++    justifyContent: 'center',
++    borderRadius: 8,
++    backgroundColor: '#8B3A3A',
++    paddingHorizontal: 16,
++    marginTop: 20,
++  },
++  saveButtonDisabled: {
++    backgroundColor: '#9C9690',
++  },
++  saveButtonText: {
++    color: '#FFFFFF',
++    fontWeight: '700',
++    letterSpacing: 0.5,
++  },
++});
+-- 
+2.43.0
